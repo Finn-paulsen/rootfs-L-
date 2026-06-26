@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
-hydra-net  —  Hive-Mind Cluster Visualizer
+hydra-net v2  —  Hive-Mind Cluster Visualizer
 Project Hydra  ·  NRF24-Gateway-01
 
-Rein visuelle, fiktive Simulation eines Bot-Clusters.
-Keinerlei echte Netzwerkaktionen.
+Rein visuelle Simulation eines Cluster-Netzwerks.
+Keinerlei echte Angriffe oder sicherheitsrelevante Aktionen.
+
+Features v2:
+  - 55 Nodes (2 echte + bis zu 10 gescannte + Rest fake)
+  - Echtes Netzwerk-Scanning (arp-scan / ping-sweep, nur Heimnetz)
+  - Zwei Ringe: innerer Ring (schnell aktiv) + äußerer Ring (langsam)
+  - Firewall-Panel (links): zeigt simulierte FW-Regeln + Alerts
+  - Cluster-Log (rechts): deutlich mehr Einträge, realistischer
+  - Backend-Integration: fragt 192.168.178.89:5000/hydra/status ab
+  - Silent-Inject: gefundene Netzwerkgeräte werden animiert eingebunden
+  - Mini-Menü (Taste M): Aktionen innerhalb der Simulation
+  - Pi-2-optimiert: 10 FPS, minimales Rendering
 """
 
 import curses
@@ -13,42 +24,41 @@ import random
 import math
 import sys
 import hashlib
+import subprocess
+import threading
+import socket
+import os
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Passwort (SHA-256-Hash von "hydra")
-# Zum Ändern: python3 -c "import hashlib; print(hashlib.sha256(b'DEINPASSWORT').hexdigest())"
 PASSWORD_HASH = hashlib.sha256(b"hydra").hexdigest()
 
-# Anzahl der simulierten Nodes (10–30 für Pi 2)
-NODE_COUNT = 20
+NODE_COUNT_INNER = 20   # Innerer Ring
+NODE_COUNT_OUTER = 35   # Äußerer Ring
+FPS              = 10   # Niedrig für Pi 2
 
-# Frames pro Sekunde (niedrig halten für Pi 2)
-FPS = 12
+DC_NAME = "HYDRA-CORE"
+DC_IP   = "192.168.178.89"   # Echtes Backend
 
-# Domain-Controller (Ziel der Fake-Infiltration)
-DC_NAME = "DC-HYDRA-CORE"
-DC_IP   = "10.0.0.1"
+BACKEND_URL = f"http://{DC_IP}:5000/hydra/status"
+SCAN_SUBNET = "192.168.178"   # Heimnetz-Subnetz
 
-# Bekannte echte Nodes (werden bevorzugt angezeigt)
 REAL_NODES = [
     {"id": "NRF24-GW-01",  "ip": "192.168.178.xx",  "role": "RF-HUB"},
     {"id": "DATA-RELAY",   "ip": "192.168.178.89",   "role": "BACKEND"},
 ]
 
-# Fake-Node-Namen-Pool
-FAKE_NODE_PREFIXES = [
-    "NODE", "BOT", "AGENT", "CELL", "UNIT", "RELAY", "PROBE", "DRONE"
-]
-FAKE_NODE_SUFFIXES = [
-    "A1","B2","C3","D4","E5","F6","G7","H8",
-    "X1","X2","X3","X4","X5","X6","X7","X8",
-    "01","02","03","04","05","06","07","08",
+FAKE_PREFIXES = ["node", "relay", "probe", "unit", "cell", "bot", "agent", "link", "peer", "host"]
+FAKE_SUFFIXES = [
+    "a1","b2","c3","d4","e5","f6","g7","h8","j9","k0",
+    "x1","x2","x3","x4","x5","x6","x7","x8","x9",
+    "01","02","03","04","05","06","07","08","09","10",
+    "11","12","13","14","15","16","17","18","19","20",
 ]
 
-# Farb-IDs (werden in init_colors() belegt)
+# Farb-IDs
 C_DEFAULT  = 0
 C_GREEN    = 1
 C_YELLOW   = 2
@@ -57,6 +67,7 @@ C_CYAN     = 4
 C_WHITE    = 5
 C_DIM      = 6
 C_MAGENTA  = 7
+C_BLUE     = 8
 
 # Node-Zustände
 STATE_INIT     = "INIT"
@@ -65,88 +76,8 @@ STATE_LINKING  = "LINK"
 STATE_ONLINE   = "ONLN"
 STATE_SYNC     = "SYNC"
 STATE_ACTIVE   = "ACTV"
+STATE_INJECT   = "INJT"   # Neu: Silent-Inject
 STATE_OFFLINE  = "OFFL"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HILFSFUNKTIONEN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def init_colors():
-    """Curses-Farbpaare initialisieren."""
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(C_GREEN,   curses.COLOR_GREEN,   -1)
-    curses.init_pair(C_YELLOW,  curses.COLOR_YELLOW,  -1)
-    curses.init_pair(C_RED,     curses.COLOR_RED,     -1)
-    curses.init_pair(C_CYAN,    curses.COLOR_CYAN,    -1)
-    curses.init_pair(C_WHITE,   curses.COLOR_WHITE,   -1)
-    curses.init_pair(C_DIM,     curses.COLOR_WHITE,   -1)
-    curses.init_pair(C_MAGENTA, curses.COLOR_MAGENTA, -1)
-
-
-def safe_addstr(win, y, x, text, attr=0):
-    """addstr ohne Absturz bei Randüberschreitung."""
-    h, w = win.getmaxyx()
-    if y < 0 or y >= h or x < 0:
-        return
-    max_len = w - x - 1
-    if max_len <= 0:
-        return
-    try:
-        win.addstr(y, x, text[:max_len], attr)
-    except curses.error:
-        pass
-
-
-def draw_box(win, y, x, h, w, color_pair=C_DIM, title=""):
-    """Einfache Box zeichnen."""
-    attr = curses.color_pair(color_pair)
-    # Ecken
-    safe_addstr(win, y,     x,     "╔", attr)
-    safe_addstr(win, y,     x+w-1, "╗", attr)
-    safe_addstr(win, y+h-1, x,     "╚", attr)
-    safe_addstr(win, y+h-1, x+w-1, "╝", attr)
-    # Horizontale Linien
-    for i in range(1, w-1):
-        safe_addstr(win, y,     x+i, "═", attr)
-        safe_addstr(win, y+h-1, x+i, "═", attr)
-    # Vertikale Linien
-    for i in range(1, h-1):
-        safe_addstr(win, y+i, x,     "║", attr)
-        safe_addstr(win, y+i, x+w-1, "║", attr)
-    # Titel
-    if title:
-        t = f" {title} "
-        tx = x + max(1, (w - len(t)) // 2)
-        safe_addstr(win, y, tx, t, attr | curses.A_BOLD)
-
-
-def state_color(state):
-    """Farbe je nach Node-Zustand."""
-    return {
-        STATE_INIT:     C_DIM,
-        STATE_SCANNING: C_YELLOW,
-        STATE_LINKING:  C_YELLOW,
-        STATE_ONLINE:   C_GREEN,
-        STATE_SYNC:     C_CYAN,
-        STATE_ACTIVE:   C_GREEN,
-        STATE_OFFLINE:  C_RED,
-    }.get(state, C_DIM)
-
-
-def fake_ip():
-    return f"10.{random.randint(0,9)}.{random.randint(0,99)}.{random.randint(2,254)}"
-
-
-def fake_id():
-    p = random.choice(FAKE_NODE_PREFIXES)
-    s = random.choice(FAKE_NODE_SUFFIXES)
-    return f"{p}-{s}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PASSWORT-GATE
-# ─────────────────────────────────────────────────────────────────────────────
 
 LOGO = [
     r"  ██╗  ██╗██╗   ██╗██████╗ ██████╗  █████╗ ",
@@ -157,14 +88,310 @@ LOGO = [
     r"  ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝",
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBALER ZUSTAND (thread-safe via Lock)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_lock            = threading.Lock()
+_scanned_hosts   = []    # IPs die per Netzwerk-Scan gefunden wurden
+_backend_status  = {}    # Letzter /hydra/status Response
+_scan_running    = False
+_backend_running = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HINTERGRUND-THREADS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _do_network_scan():
+    """Ping-Sweep über Heimnetz-Subnetz (Hintergrundthread)."""
+    global _scan_running
+    found = []
+    for last_octet in range(1, 255):
+        ip = f"{SCAN_SUBNET}.{last_octet}"
+        try:
+            r = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                capture_output=True, timeout=2
+            )
+            if r.returncode == 0:
+                found.append(ip)
+        except Exception:
+            pass
+    with _lock:
+        _scanned_hosts.clear()
+        _scanned_hosts.extend(found)
+    _scan_running = False
+
+
+def start_network_scan():
+    global _scan_running
+    if not _scan_running:
+        _scan_running = True
+        t = threading.Thread(target=_do_network_scan, daemon=True)
+        t.start()
+
+
+def _do_backend_poll():
+    """Backend-Status alle 30s abfragen (Hintergrundthread)."""
+    global _backend_running
+    while _backend_running:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--connect-timeout", "3", "--max-time", "5", BACKEND_URL],
+                capture_output=True, text=True, timeout=8
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                import json
+                data = json.loads(r.stdout)
+                with _lock:
+                    _backend_status.update(data)
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def start_backend_poll():
+    global _backend_running
+    _backend_running = True
+    t = threading.Thread(target=_do_backend_poll, daemon=True)
+    t.start()
+
+
+def stop_backend_poll():
+    global _backend_running
+    _backend_running = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HILFSFUNKTIONEN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_GREEN,   curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_YELLOW,  curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_RED,     curses.COLOR_RED,     -1)
+    curses.init_pair(C_CYAN,    curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_WHITE,   curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_DIM,     curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_MAGENTA, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_BLUE,    curses.COLOR_BLUE,    -1)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0:
+        return
+    max_len = w - x - 1
+    if max_len <= 0:
+        return
+    try:
+        win.addstr(y, x, str(text)[:max_len], attr)
+    except curses.error:
+        pass
+
+
+def draw_box(win, y, x, h, w, color_pair=C_DIM, title=""):
+    attr = curses.color_pair(color_pair)
+    safe_addstr(win, y,     x,     "╔", attr)
+    safe_addstr(win, y,     x+w-1, "╗", attr)
+    safe_addstr(win, y+h-1, x,     "╚", attr)
+    safe_addstr(win, y+h-1, x+w-1, "╝", attr)
+    for i in range(1, w-1):
+        safe_addstr(win, y,     x+i, "═", attr)
+        safe_addstr(win, y+h-1, x+i, "═", attr)
+    for i in range(1, h-1):
+        safe_addstr(win, y+i, x,     "║", attr)
+        safe_addstr(win, y+i, x+w-1, "║", attr)
+    if title:
+        t = f" {title} "
+        tx = x + max(1, (w - len(t)) // 2)
+        safe_addstr(win, y, tx, t, attr | curses.A_BOLD)
+
+
+def state_color(state):
+    return {
+        STATE_INIT:     C_DIM,
+        STATE_SCANNING: C_YELLOW,
+        STATE_LINKING:  C_YELLOW,
+        STATE_ONLINE:   C_GREEN,
+        STATE_SYNC:     C_CYAN,
+        STATE_ACTIVE:   C_GREEN,
+        STATE_INJECT:   C_MAGENTA,
+        STATE_OFFLINE:  C_RED,
+    }.get(state, C_DIM)
+
+
+def fake_ip():
+    return f"10.{random.randint(0,9)}.{random.randint(0,99)}.{random.randint(2,254)}"
+
+
+def fake_id():
+    p = random.choice(FAKE_PREFIXES)
+    s = random.choice(FAKE_SUFFIXES)
+    return f"{p}-{s}"
+
+
+def bresenham(x0, y0, x1, y1):
+    pts = []
+    dx = abs(x1 - x0); dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        pts.append((x0, y0))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy; x0 += sx
+        if e2 < dx:
+            err += dx; y0 += sy
+    return pts
+
+
+def line_char(x0, y0, x1, y1):
+    dx = x1 - x0; dy = y1 - y0
+    if dy == 0:   return "─"
+    if dx == 0:   return "│"
+    if (dx > 0 and dy < 0) or (dx < 0 and dy > 0):
+        return "╱"
+    return "╲"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE-DATENMODELL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Node:
+    def __init__(self, nid, ip, role="bot", real=False, ring=0, injected=False):
+        self.id        = nid
+        self.ip        = ip
+        self.role      = role
+        self.real      = real
+        self.ring      = ring        # 0 = innerer Ring, 1 = äußerer Ring
+        self.injected  = injected    # Durch Netzwerk-Scan gefunden
+        self.state     = STATE_INIT
+        self.blink     = False
+        self.progress  = 0
+        self.cx        = 0
+        self.cy        = 0
+        self._start_frame = 0
+        self._inject_frame = 0       # Frame wenn Inject-Sequenz startet
+
+    def tick(self, frame):
+        self.blink = (frame % 6) < 3
+
+        # Injected Nodes: spezielle Sequenz
+        if self.injected and self.state == STATE_INIT:
+            if frame > self._inject_frame:
+                self.state = STATE_INJECT
+                return
+        if self.injected and self.state == STATE_INJECT:
+            self.progress = min(100, self.progress + random.randint(2, 8))
+            if self.progress >= 100:
+                self.state = STATE_LINKING
+                self.progress = 0
+            return
+
+        # Normaler Ablauf
+        if self.state == STATE_INIT and frame > random.randint(3, 20):
+            self.state = STATE_SCANNING
+        elif self.state == STATE_SCANNING:
+            self.progress = min(100, self.progress + random.randint(4, 14))
+            if self.progress >= 100:
+                self.state = STATE_LINKING
+                self.progress = 0
+        elif self.state == STATE_LINKING:
+            self.progress = min(100, self.progress + random.randint(6, 18))
+            if self.progress >= 100:
+                self.state = STATE_ONLINE
+                self.progress = 0
+        elif self.state == STATE_ONLINE:
+            self.state = STATE_SYNC
+        elif self.state == STATE_SYNC:
+            if frame % 15 == 0 and random.random() < 0.5:
+                self.state = STATE_ACTIVE
+
+
+def build_nodes(inner_count, outer_count):
+    """Nodes aufbauen: echte + fake (zwei Ringe)."""
+    nodes = []
+    used_ids = set()
+
+    # Echte Nodes → innerer Ring
+    for r in REAL_NODES:
+        n = Node(r["id"], r["ip"], r["role"], real=True, ring=0)
+        nodes.append(n)
+        used_ids.add(n.id)
+
+    # Innerer Ring auffüllen
+    while sum(1 for n in nodes if n.ring == 0) < inner_count:
+        nid = fake_id()
+        if nid not in used_ids:
+            used_ids.add(nid)
+            nodes.append(Node(nid, fake_ip(), ring=0))
+
+    # Äußerer Ring
+    while sum(1 for n in nodes if n.ring == 1) < outer_count:
+        nid = fake_id()
+        if nid not in used_ids:
+            used_ids.add(nid)
+            nodes.append(Node(nid, fake_ip(), ring=1))
+
+    return nodes
+
+
+def assign_positions(nodes, cx, cy, r_inner, r_outer):
+    """Zwei konzentrische Ringe."""
+    inner = [n for n in nodes if n.ring == 0]
+    outer = [n for n in nodes if n.ring == 1]
+
+    for i, node in enumerate(inner):
+        angle = (2 * math.pi * i / max(len(inner), 1)) - math.pi / 2
+        node.cx = int(cx + r_inner * math.cos(angle) * 2.1)
+        node.cy = int(cy + r_inner * math.sin(angle))
+
+    for i, node in enumerate(outer):
+        angle = (2 * math.pi * i / max(len(outer), 1)) - math.pi / 2
+        node.cx = int(cx + r_outer * math.cos(angle) * 2.1)
+        node.cy = int(cy + r_outer * math.sin(angle))
+
+
+def inject_scanned_hosts(nodes):
+    """Gefundene Netzwerk-Hosts als Injected-Nodes einbinden."""
+    with _lock:
+        hosts = list(_scanned_hosts)
+
+    existing_ips = {n.ip for n in nodes}
+    injected_count = 0
+
+    for ip in hosts:
+        if ip in existing_ips:
+            continue
+        # Letztes Oktett als ID
+        last = ip.split(".")[-1]
+        nid = f"host-{last}"
+        if any(n.id == nid for n in nodes):
+            continue
+        n = Node(nid, ip, role="host", ring=1, injected=True)
+        n._inject_frame = random.randint(5, 30)
+        nodes.append(n)
+        existing_ips.add(ip)
+        injected_count += 1
+
+    return injected_count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASSWORT-GATE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def password_gate(stdscr):
-    """Passwort-Eingabe vor dem Start. Gibt True zurück wenn korrekt."""
     curses.curs_set(1)
-    curses.echo()
     h, w = stdscr.getmaxyx()
     stdscr.clear()
 
-    # Logo
     logo_y = max(1, h // 2 - 8)
     for i, line in enumerate(LOGO):
         x = max(0, (w - len(line)) // 2)
@@ -192,7 +419,6 @@ def password_gate(stdscr):
                     "  > ",
                     curses.color_pair(C_GREEN) | curses.A_BOLD)
 
-        # Passwort unsichtbar einlesen
         curses.noecho()
         curses.curs_set(1)
         stdscr.move(prompt_y + 1, max(0, (w - 36) // 2) + 4)
@@ -201,22 +427,21 @@ def password_gate(stdscr):
         pw = ""
         while True:
             ch = stdscr.getch()
-            if ch in (10, 13):  # Enter
+            if ch in (10, 13):
                 break
             elif ch in (127, curses.KEY_BACKSPACE, 8):
                 if pw:
                     pw = pw[:-1]
-                    cy, cx = stdscr.getyx()
-                    safe_addstr(stdscr, cy, cx - 1, " ")
-                    stdscr.move(cy, cx - 1)
+                    cy2, cx2 = stdscr.getyx()
+                    safe_addstr(stdscr, cy2, cx2 - 1, " ")
+                    stdscr.move(cy2, cx2 - 1)
             elif 32 <= ch <= 126:
                 pw += chr(ch)
                 safe_addstr(stdscr, prompt_y + 1,
                              max(0, (w - 36) // 2) + 4 + len(pw) - 1,
                              "●", curses.color_pair(C_GREEN))
 
-        entered_hash = hashlib.sha256(pw.encode()).hexdigest()
-        if entered_hash == PASSWORD_HASH:
+        if hashlib.sha256(pw.encode()).hexdigest() == PASSWORD_HASH:
             safe_addstr(stdscr, prompt_y + 3,
                         max(0, (w - 36) // 2),
                         "  AUTH VERIFIED  ·  ACCESS GRANTED    ",
@@ -232,7 +457,6 @@ def password_gate(stdscr):
                         curses.color_pair(C_RED) | curses.A_BOLD)
             stdscr.refresh()
             time.sleep(1.5)
-            # Zeile leeren für nächsten Versuch
             safe_addstr(stdscr, prompt_y + 1,
                         max(0, (w - 36) // 2),
                         "  >                                   ",
@@ -252,168 +476,157 @@ def password_gate(stdscr):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NODE-DATENMODELL
+# MINI-MENÜ (Taste M)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Node:
-    def __init__(self, nid, ip, role="BOT", real=False):
-        self.id    = nid
-        self.ip    = ip
-        self.role  = role
-        self.real  = real
-        self.state = STATE_INIT
-        self.blink = False          # für Blink-Effekt
-        self.progress = 0           # 0–100 für Verbindungsaufbau
-        # Position im Cluster-Layout (wird später gesetzt)
-        self.cx = 0
-        self.cy = 0
+MENU_ITEMS = [
+    ("Netzwerk-Scan starten",        "scan"),
+    ("Silent-Inject alle Hosts",     "inject"),
+    ("Backend-Status abrufen",       "backend"),
+    ("Cluster zurücksetzen",         "reset"),
+    ("Abbrechen",                    "cancel"),
+]
 
-    def tick(self, frame):
-        """Zustandsübergänge simulieren."""
-        # Blink-Effekt für SYNC/SCANNING
-        self.blink = (frame % 6) < 3
+def show_menu(stdscr, nodes):
+    """Overlay-Menü innerhalb der Simulation."""
+    h, w = stdscr.getmaxyx()
+    mh = len(MENU_ITEMS) + 4
+    mw = 36
+    my = (h - mh) // 2
+    mx = (w - mw) // 2
 
-        if self.state == STATE_INIT and frame > random.randint(5, 25):
-            self.state = STATE_SCANNING
-        elif self.state == STATE_SCANNING:
-            self.progress = min(100, self.progress + random.randint(3, 12))
-            if self.progress >= 100:
-                self.state = STATE_LINKING
-                self.progress = 0
-        elif self.state == STATE_LINKING:
-            self.progress = min(100, self.progress + random.randint(5, 15))
-            if self.progress >= 100:
-                self.state = STATE_ONLINE
-                self.progress = 0
-        elif self.state == STATE_ONLINE:
-            self.state = STATE_SYNC
-        elif self.state == STATE_SYNC:
-            if frame % 20 == 0 and random.random() < 0.4:
-                self.state = STATE_ACTIVE
+    selected = 0
+    curses.curs_set(0)
 
-
-def build_nodes(count):
-    """Node-Liste aufbauen: echte Nodes + Fake-Nodes."""
-    nodes = []
-    # Echte Nodes zuerst
-    for r in REAL_NODES:
-        nodes.append(Node(r["id"], r["ip"], r["role"], real=True))
-    # Fake-Nodes auffüllen
-    used_ids = {n.id for n in nodes}
-    while len(nodes) < count:
-        nid = fake_id()
-        if nid not in used_ids:
-            used_ids.add(nid)
-            nodes.append(Node(nid, fake_ip()))
-    return nodes
-
-
-def assign_positions(nodes, cx, cy, radius):
-    """Nodes kreisförmig um Mittelpunkt anordnen."""
-    n = len(nodes)
-    for i, node in enumerate(nodes):
-        angle = (2 * math.pi * i / n) - math.pi / 2
-        node.cx = int(cx + radius * math.cos(angle) * 2.2)  # *2.2 wegen Zeichenbreite
-        node.cy = int(cy + radius * math.sin(angle))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VERBINDUNGSLINIEN (Bresenham)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def bresenham(x0, y0, x1, y1):
-    """Bresenham-Linie als Punktliste."""
-    pts = []
-    dx = abs(x1 - x0); dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
     while True:
-        pts.append((x0, y0))
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy; x0 += sx
-        if e2 < dx:
-            err += dx; y0 += sy
-    return pts
+        # Menü-Box zeichnen
+        draw_box(stdscr, my, mx, mh, mw, C_CYAN, "CLUSTER CONTROL")
+        for i, (label, _) in enumerate(MENU_ITEMS):
+            attr = curses.color_pair(C_GREEN) | curses.A_BOLD if i == selected \
+                   else curses.color_pair(C_DIM)
+            prefix = "▶ " if i == selected else "  "
+            safe_addstr(stdscr, my + 2 + i, mx + 2,
+                        (prefix + label).ljust(mw - 4), attr)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == curses.KEY_UP:
+            selected = (selected - 1) % len(MENU_ITEMS)
+        elif key == curses.KEY_DOWN:
+            selected = (selected + 1) % len(MENU_ITEMS)
+        elif key in (10, 13, ord(' ')):
+            action = MENU_ITEMS[selected][1]
+            return action
+        elif key in (ord('q'), ord('Q'), 27):
+            return "cancel"
 
 
-def line_char(x0, y0, x1, y1):
-    """Passenden Liniencharakter für Richtung wählen."""
-    dx = x1 - x0; dy = y1 - y0
-    if dy == 0:
-        return "─"
-    if dx == 0:
-        return "│"
-    if (dx > 0 and dy < 0) or (dx < 0 and dy > 0):
-        return "╱"
-    return "╲"
+def execute_menu_action(action, nodes, log_entries, frame):
+    """Menü-Aktion ausführen."""
+    if action == "scan":
+        start_network_scan()
+        log_entries.append((frame, C_CYAN, "Network scan initiated..."))
+    elif action == "inject":
+        count = inject_scanned_hosts(nodes)
+        if count > 0:
+            log_entries.append((frame, C_MAGENTA, f"Silent-inject: {count} host(s) queued"))
+        else:
+            log_entries.append((frame, C_YELLOW, "No new hosts to inject"))
+    elif action == "backend":
+        with _lock:
+            if _backend_status:
+                uptime = _backend_status.get("uptime", "?")
+                active = _backend_status.get("active_nodes", "?")
+                log_entries.append((frame, C_GREEN,
+                    f"Backend: online  uptime={uptime}  nodes={active}"))
+            else:
+                log_entries.append((frame, C_YELLOW, "Backend: no response yet"))
+    elif action == "reset":
+        for n in nodes:
+            n.state    = STATE_INIT
+            n.progress = 0
+        log_entries.append((frame, C_YELLOW, "Cluster reset initiated"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HAUPT-VISUALISIERUNG
+# ZEICHENFUNKTIONEN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draw_header(win, frame):
-    """Titelzeile oben."""
+def draw_header(win, frame, nodes):
     h, w = win.getmaxyx()
     blink_attr = curses.color_pair(C_GREEN) | curses.A_BOLD
     if (frame % 8) < 4:
         blink_attr = curses.color_pair(C_CYAN) | curses.A_BOLD
 
-    title = "  HYDRA  ·  HIVE-MIND CLUSTER  ·  LIVE OVERVIEW  "
+    total   = len(nodes)
+    online  = sum(1 for n in nodes if n.state in (STATE_ONLINE, STATE_SYNC, STATE_ACTIVE))
+    injected = sum(1 for n in nodes if n.injected)
+
+    title = f"  HYDRA  ·  HIVE-MIND CLUSTER  ·  {total} NODES  ·  {online} ONLINE  "
+    if injected:
+        title += f"·  {injected} INJECTED  "
+
     safe_addstr(win, 0, 0, "═" * (w - 1), curses.color_pair(C_DIM))
     safe_addstr(win, 0, max(0, (w - len(title)) // 2), title, blink_attr)
 
 
 def draw_footer(win, nodes, frame):
-    """Statuszeile unten."""
     h, w = win.getmaxyx()
     online  = sum(1 for n in nodes if n.state in (STATE_ONLINE, STATE_SYNC, STATE_ACTIVE))
     synced  = sum(1 for n in nodes if n.state in (STATE_SYNC, STATE_ACTIVE))
-    total   = len(nodes)
-    ts      = time.strftime("%H:%M:%S")
+    injected = sum(1 for n in nodes if n.injected)
+    ts = time.strftime("%H:%M:%S")
 
     safe_addstr(win, h - 2, 0, "═" * (w - 1), curses.color_pair(C_DIM))
-    status = (f"  NODES: {total} total  ·  {online} online  ·  "
-              f"{synced} synced  ·  {ts}  ·  [Q] quit  ")
+    status = (
+        f"  NODES: {len(nodes)} total  ·  {online} online  ·  "
+        f"{synced} synced  ·  {injected} injected  ·  {ts}  "
+        f"  [M] menu  [S] scan  [Q] quit  "
+    )
     safe_addstr(win, h - 1, 0, status, curses.color_pair(C_DIM))
 
 
 def draw_node(win, node, frame):
-    """Einzelnen Node als Box zeichnen."""
     h, w = win.getmaxyx()
     x, y = node.cx, node.cy
-    if y < 2 or y >= h - 4 or x < 1 or x >= w - 12:
+
+    # Seitenränder freihalten (Panels links+rechts)
+    fw_w  = 26   # Firewall-Panel-Breite
+    log_w = 34   # Log-Panel-Breite
+    if y < 2 or y >= h - 4:
+        return
+    if x < fw_w + 1 or x >= w - log_w - 12:
         return
 
     state = node.state
     col   = curses.color_pair(state_color(state))
     dim   = curses.color_pair(C_DIM)
 
-    # Blink bei SCANNING/SYNC
     if state in (STATE_SCANNING, STATE_SYNC) and not node.blink:
         col = dim
 
-    # Node-Box (3 Zeilen)
+    # Injected-Nodes: magenta blinken
+    if state == STATE_INJECT:
+        col = curses.color_pair(C_MAGENTA) | curses.A_BOLD if node.blink \
+              else curses.color_pair(C_DIM)
+
     label = node.id[:10]
     safe_addstr(win, y,     x, f"[{label:<10}]", col | curses.A_BOLD)
-    safe_addstr(win, y + 1, x, f" {state} ", col)
 
-    # Fortschrittsbalken bei SCANNING/LINKING
-    if state in (STATE_SCANNING, STATE_LINKING):
-        bar_w = 10
+    if state in (STATE_SCANNING, STATE_LINKING, STATE_INJECT):
+        bar_w  = 10
         filled = int(node.progress / 100 * bar_w)
-        bar = "█" * filled + "░" * (bar_w - filled)
+        bar    = "█" * filled + "░" * (bar_w - filled)
         safe_addstr(win, y + 1, x + 1, bar, curses.color_pair(C_YELLOW))
+    else:
+        safe_addstr(win, y + 1, x, f" {state} ", col)
 
 
 def draw_connections(win, nodes, frame):
-    """Verbindungslinien zwischen aktiven Nodes und Zentrum zeichnen."""
     h, w = win.getmaxyx()
-    cx = w // 2
+    fw_w  = 26
+    log_w = 34
+    cx = (w - log_w + fw_w) // 2
     cy = (h - 2) // 2
 
     active_states = (STATE_ONLINE, STATE_SYNC, STATE_ACTIVE)
@@ -423,18 +636,29 @@ def draw_connections(win, nodes, frame):
             continue
 
         pts = bresenham(node.cx + 6, node.cy, cx, cy)
-        # Nur jeden 2. Punkt zeichnen (Performance + Optik)
+        # Äußerer Ring: dünnere Linie (jeden 3. Punkt)
+        step = 3 if node.ring == 1 else 2
+
         for i, (px, py) in enumerate(pts[2:-2]):
-            if i % 2 != 0:
+            if i % step != 0:
                 continue
-            if py < 2 or py >= h - 2 or px < 1 or px >= w - 1:
+            if py < 2 or py >= h - 2:
                 continue
-            # Animiertes "Fließen" entlang der Linie
-            flow_offset = (frame + i) % 8
+            if px < fw_w + 1 or px >= w - log_w - 1:
+                continue
+
+            flow_offset = (frame + i) % 10
             if flow_offset < 2:
                 ch_attr = curses.color_pair(C_CYAN) | curses.A_BOLD
+            elif flow_offset < 4:
+                ch_attr = curses.color_pair(C_GREEN)
             else:
                 ch_attr = curses.color_pair(C_DIM)
+
+            # Injected-Nodes: magenta Linie
+            if node.injected:
+                ch_attr = curses.color_pair(C_MAGENTA) if flow_offset < 3 \
+                          else curses.color_pair(C_DIM)
 
             lc = line_char(node.cx + 6, node.cy, cx, cy)
             try:
@@ -444,91 +668,191 @@ def draw_connections(win, nodes, frame):
 
 
 def draw_center(win, frame, phase):
-    """Zentrum: Domain-Controller / Hydra-Core."""
     h, w = win.getmaxyx()
-    cx = w // 2 - 9
-    cy = (h - 2) // 2 - 1
+    fw_w  = 26
+    log_w = 34
+    cx = (w - log_w + fw_w) // 2 - 10
+    cy = (h - 2) // 2 - 2
+
+    with _lock:
+        backend_online = bool(_backend_status)
 
     if phase < 3:
-        col = curses.color_pair(C_YELLOW) | curses.A_BOLD
-        label = f"  {DC_NAME}  "
-        sub   = f"  {DC_IP}   "
+        col    = curses.color_pair(C_YELLOW) | curses.A_BOLD
         status = "  SCANNING...  " if (frame % 8) < 4 else "  PROBING...   "
+        box_c  = C_YELLOW
     elif phase < 5:
-        col = curses.color_pair(C_MAGENTA) | curses.A_BOLD
-        label = f"  {DC_NAME}  "
-        sub   = f"  {DC_IP}   "
+        col    = curses.color_pair(C_MAGENTA) | curses.A_BOLD
         status = "  INFILTRATING " if (frame % 6) < 3 else "  ESCALATING...  "
+        box_c  = C_MAGENTA
     else:
-        col = curses.color_pair(C_GREEN) | curses.A_BOLD
-        label = f"  {DC_NAME}  "
-        sub   = f"  {DC_IP}   "
+        col    = curses.color_pair(C_GREEN) | curses.A_BOLD
         status = "  COMPROMISED  "
+        box_c  = C_GREEN
 
-    draw_box(win, cy - 1, cx, 5, 20,
-             C_MAGENTA if phase >= 3 else C_YELLOW,
-             "TARGET")
-    safe_addstr(win, cy,     cx + 1, label,  col)
-    safe_addstr(win, cy + 1, cx + 1, sub,    curses.color_pair(C_DIM))
-    safe_addstr(win, cy + 2, cx + 1, status, col)
+    backend_str = f"  {DC_IP}  "
+    be_col = curses.color_pair(C_GREEN) if backend_online else curses.color_pair(C_RED)
+
+    draw_box(win, cy, cx, 6, 22, box_c, "CORE")
+    safe_addstr(win, cy + 1, cx + 1, f"  {DC_NAME}  ", col)
+    safe_addstr(win, cy + 2, cx + 1, backend_str, be_col)
+    safe_addstr(win, cy + 3, cx + 1,
+                "  BACKEND: " + ("ONLINE " if backend_online else "OFFLINE"),
+                be_col)
+    safe_addstr(win, cy + 4, cx + 1, status, col)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INFILTRATIONS-SEQUENZ (rechte Spalte)
+# FIREWALL-PANEL (links)
+# ─────────────────────────────────────────────────────────────────────────────
+
+FW_RULES = [
+    ("ALLOW", "192.168.178.0/24", "→ CORE",  C_GREEN),
+    ("ALLOW", "10.0.0.0/8",       "→ RELAY", C_GREEN),
+    ("BLOCK", "0.0.0.0/0",        "→ WAN",   C_RED),
+    ("ALLOW", "NRF24-GW-01",      "→ CORE",  C_GREEN),
+    ("ALLOW", "DATA-RELAY",       "→ CORE",  C_GREEN),
+    ("BLOCK", "*.*.*.255",        "BCAST",   C_RED),
+]
+
+FW_ALERTS = [
+    "Port scan detected: 10.x.x.x",
+    "Unknown probe: 192.168.178.1",
+    "Rate limit: relay-b2",
+    "Auth attempt: host-23",
+    "Packet drop: WAN egress",
+    "Tunnel established: GW-01",
+    "ACL bypass attempt blocked",
+    "Reconnect: node-c3",
+]
+
+def draw_firewall_panel(win, frame, nodes):
+    h, w = win.getmaxyx()
+    pw = 25
+    ph = h - 4
+    px = 0
+    py = 2
+
+    draw_box(win, py - 1, px, ph, pw, C_DIM, "FIREWALL")
+
+    # Regeln
+    safe_addstr(win, py, px + 2, "── Rules ──────────────",
+                curses.color_pair(C_DIM))
+    for i, (action, src, dst, col) in enumerate(FW_RULES):
+        if py + 1 + i >= py + ph - 8:
+            break
+        attr = curses.color_pair(col)
+        line = f"{action:<5} {src:<18}"[:pw - 4]
+        safe_addstr(win, py + 1 + i, px + 2, line, attr)
+        dst_line = f"       {dst}"[:pw - 4]
+        safe_addstr(win, py + 2 + i, px + 2, dst_line,
+                    curses.color_pair(C_DIM))
+
+    # Alerts (rotierend)
+    alert_y = py + 1 + len(FW_RULES) * 2 + 1
+    safe_addstr(win, alert_y, px + 2, "── Alerts ─────────────",
+                curses.color_pair(C_DIM))
+    alert_count = min(4, ph - (alert_y - py) - 3)
+    offset = (frame // 20) % len(FW_ALERTS)
+    for i in range(alert_count):
+        idx  = (offset + i) % len(FW_ALERTS)
+        text = FW_ALERTS[idx][:pw - 4]
+        col  = C_RED if "blocked" in text or "drop" in text or "attempt" in text \
+               else C_YELLOW
+        blink = col == C_RED and (frame % 6) < 3
+        attr = curses.color_pair(col) | (curses.A_BOLD if blink else 0)
+        safe_addstr(win, alert_y + 1 + i, px + 2, text, attr)
+
+    # Injected-Hosts zählen
+    injected = [n for n in nodes if n.injected]
+    inj_y = py + ph - 4
+    safe_addstr(win, inj_y, px + 2, "── Injected ───────────",
+                curses.color_pair(C_DIM))
+    safe_addstr(win, inj_y + 1, px + 2,
+                f"  {len(injected)} host(s) in cluster",
+                curses.color_pair(C_MAGENTA if injected else C_DIM))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLUSTER-LOG (rechts) – deutlich mehr Einträge
 # ─────────────────────────────────────────────────────────────────────────────
 
 INFIL_STEPS = [
-    (0,  C_DIM,     "Initializing cluster..."),
-    (8,  C_YELLOW,  "Scanning target network..."),
-    (16, C_YELLOW,  "Mapping domain topology..."),
-    (24, C_YELLOW,  "Identifying DC: " + DC_IP),
-    (32, C_CYAN,    "Establishing encrypted tunnel..."),
-    (40, C_CYAN,    "Injecting auth probe..."),
-    (48, C_MAGENTA, "Accessing Domain Controller..."),
-    (56, C_MAGENTA, "Privilege escalation in progress..."),
-    (64, C_MAGENTA, "Bypassing ACL restrictions..."),
-    (72, C_RED,     "ALERT: Firewall response detected"),
-    (76, C_MAGENTA, "Rerouting via secondary nodes..."),
-    (84, C_GREEN,   "Cluster synchronized."),
-    (90, C_GREEN,   "Domain Controller: COMPROMISED"),
-    (96, C_GREEN,   "Hydra-Cluster: FULLY ACTIVE"),
+    (0,   C_DIM,     "Cluster boot sequence..."),
+    (5,   C_DIM,     "Loading node registry..."),
+    (10,  C_YELLOW,  "Scanning target network..."),
+    (15,  C_YELLOW,  "Mapping subnet topology..."),
+    (20,  C_YELLOW,  f"Locating core: {DC_IP}"),
+    (25,  C_YELLOW,  "ARP table populated."),
+    (30,  C_CYAN,    "Establishing relay tunnel..."),
+    (35,  C_CYAN,    "Encrypting channel..."),
+    (40,  C_CYAN,    "Auth handshake in progress..."),
+    (45,  C_CYAN,    "Injecting auth probe..."),
+    (50,  C_MAGENTA, "Accessing core node..."),
+    (55,  C_MAGENTA, "Privilege escalation..."),
+    (58,  C_MAGENTA, "Bypassing ACL layer..."),
+    (62,  C_RED,     "ALERT: Firewall response"),
+    (65,  C_MAGENTA, "Rerouting via outer ring..."),
+    (68,  C_MAGENTA, "Secondary path established."),
+    (72,  C_MAGENTA, "Injecting silent payload..."),
+    (76,  C_YELLOW,  "Waiting for cluster sync..."),
+    (80,  C_GREEN,   "Inner ring: synchronized."),
+    (84,  C_GREEN,   "Outer ring: synchronized."),
+    (88,  C_GREEN,   "Core node: LINKED"),
+    (92,  C_GREEN,   "Cluster: FULLY ACTIVE"),
+    (96,  C_GREEN,   f"Backend ({DC_IP}): ONLINE"),
+    (100, C_GREEN,   "Hive-Mind: OPERATIONAL"),
 ]
 
-def draw_log_panel(win, frame, phase):
-    """Rechte Spalte: Infiltrations-Log."""
+def draw_log_panel(win, frame, phase, extra_entries):
     h, w = win.getmaxyx()
-    panel_w = min(36, w // 3)
-    px = w - panel_w - 1
+    pw = 33
+    px = w - pw - 1
     py = 2
 
-    draw_box(win, py - 1, px, h - py - 2, panel_w, C_DIM, "CLUSTER LOG")
+    draw_box(win, py - 1, px, h - py - 2, pw, C_DIM, "CLUSTER LOG")
 
-    max_lines = h - py - 4
-    visible = []
-    for (trigger, color, text) in INFIL_STEPS:
-        if frame >= trigger:
-            visible.append((color, text))
+    max_lines = h - py - 5
 
-    # Nur die letzten max_lines anzeigen
+    # Statische Schritte
+    visible = [(c, t) for (trigger, c, t) in INFIL_STEPS if frame >= trigger]
+
+    # Dynamische Einträge (aus Menü-Aktionen)
+    for (ef, ec, et) in extra_entries:
+        visible.append((ec, et))
+
     visible = visible[-max_lines:]
 
     for i, (color, text) in enumerate(visible):
         is_last = (i == len(visible) - 1)
-        attr = curses.color_pair(color)
+        attr    = curses.color_pair(color)
         if is_last:
             attr |= curses.A_BOLD
         prefix = "▶ " if is_last else "  "
         safe_addstr(win, py + i, px + 2,
-                    (prefix + text)[: panel_w - 4], attr)
+                    (prefix + text)[:pw - 4], attr)
 
-    # Fortschrittsbalken unten im Panel
-    bar_y = h - py - 3
+    # Fortschrittsbalken
+    bar_y    = h - py - 3
     progress = min(100, int(frame / 100 * 100))
-    bar_w = panel_w - 6
-    filled = int(progress / 100 * bar_w)
-    bar = "█" * filled + "░" * (bar_w - filled)
+    bar_w    = pw - 8
+    filled   = int(progress / 100 * bar_w)
+    bar      = "█" * filled + "░" * (bar_w - filled)
     safe_addstr(win, bar_y, px + 2,
                 f"{progress:3d}% {bar}", curses.color_pair(C_GREEN))
+
+    # Backend-Status
+    with _lock:
+        be = _backend_status
+    if be:
+        uptime = be.get("uptime", "?")
+        safe_addstr(win, bar_y + 1, px + 2,
+                    f"BE: {uptime}"[:pw - 4],
+                    curses.color_pair(C_GREEN))
+    else:
+        safe_addstr(win, bar_y + 1, px + 2,
+                    "BE: connecting..."[:pw - 4],
+                    curses.color_pair(C_DIM))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,12 +860,11 @@ def draw_log_panel(win, frame, phase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_phase(frame):
-    """Simulationsphase aus Frame ableiten."""
-    if frame < 30:  return 1   # Initialisierung
-    if frame < 60:  return 2   # Scanning
-    if frame < 80:  return 3   # Infiltration beginnt
-    if frame < 95:  return 4   # Eskalation
-    return 5                   # Kompromittiert
+    if frame < 30:  return 1
+    if frame < 60:  return 2
+    if frame < 80:  return 3
+    if frame < 95:  return 4
+    return 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -549,73 +872,100 @@ def get_phase(frame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_simulation(stdscr):
-    """Haupt-Animations-Loop."""
     init_colors()
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(1000 // FPS)
 
-    # Passwort-Gate
     if not password_gate(stdscr):
         return
 
+    # Hintergrund-Threads starten
+    start_backend_poll()
+    start_network_scan()
+
     # Nodes aufbauen
-    nodes = build_nodes(NODE_COUNT)
+    nodes = build_nodes(NODE_COUNT_INNER, NODE_COUNT_OUTER)
 
-    # Positionen berechnen
     h, w = stdscr.getmaxyx()
-    panel_w = min(36, w // 3)
-    usable_w = w - panel_w - 2
-    cx = usable_w // 2
-    cy = (h - 2) // 2
-    radius = min(cx - 14, cy - 4, 14)
-    assign_positions(nodes, cx, cy, radius)
+    fw_w  = 26
+    log_w = 34
+    usable_cx = (w - log_w + fw_w) // 2
+    usable_cy = (h - 2) // 2
+    r_inner   = min((usable_cx - fw_w - 14) // 2, (usable_cy - 4) // 1, 10)
+    r_outer   = min((usable_cx - fw_w - 14) // 2 + 6, (usable_cy - 4), 16)
+    assign_positions(nodes, usable_cx, usable_cy, r_inner, r_outer)
 
-    # Zufälligen Start-Frame-Offset pro Node
     for i, node in enumerate(nodes):
-        node._start_frame = random.randint(0, 20)
+        node._start_frame = random.randint(0, 30)
 
-    frame = 0
+    frame        = 0
+    extra_log    = []   # Dynamische Log-Einträge aus Menü-Aktionen
+    inject_done  = False
 
     while True:
-        # Eingabe prüfen
         key = stdscr.getch()
+
         if key in (ord('q'), ord('Q')):
             break
 
-        # Terminal-Größe neu einlesen (Resize-Handling)
+        elif key in (ord('m'), ord('M')):
+            # Mini-Menü öffnen
+            stdscr.nodelay(False)
+            action = show_menu(stdscr, nodes)
+            execute_menu_action(action, nodes, extra_log, frame)
+            stdscr.nodelay(True)
+            stdscr.timeout(1000 // FPS)
+
+        elif key in (ord('s'), ord('S')):
+            start_network_scan()
+            extra_log.append((frame, C_CYAN, "Network scan started..."))
+
+        # Terminal-Größe
         h, w = stdscr.getmaxyx()
-        panel_w = min(36, w // 3)
-        usable_w = w - panel_w - 2
-        cx = usable_w // 2
-        cy = (h - 2) // 2
-        radius = min(cx - 14, cy - 4, 14)
-        assign_positions(nodes, cx, cy, radius)
+        fw_w  = 26
+        log_w = 34
+        usable_cx = (w - log_w + fw_w) // 2
+        usable_cy = (h - 2) // 2
+        r_inner   = max(4, min((usable_cx - fw_w - 14) // 2, (usable_cy - 4), 10))
+        r_outer   = max(7, min((usable_cx - fw_w - 14) // 2 + 7, (usable_cy - 3), 17))
+        assign_positions(nodes, usable_cx, usable_cy, r_inner, r_outer)
 
         phase = get_phase(frame)
 
-        # Nodes ticken lassen
+        # Automatisch Scan-Ergebnisse einbinden (einmalig nach Phase 2)
+        if phase >= 2 and not inject_done and not _scan_running:
+            count = inject_scanned_hosts(nodes)
+            if count > 0:
+                extra_log.append((frame, C_MAGENTA,
+                    f"Silent-inject: {count} host(s)"))
+            inject_done = True
+
+        # Nodes ticken
         for node in nodes:
             if frame >= node._start_frame:
                 node.tick(frame - node._start_frame)
 
-        # Bildschirm aufbauen
+        # Zeichnen
         stdscr.erase()
-        draw_header(stdscr, frame)
+        draw_header(stdscr, frame, nodes)
         draw_connections(stdscr, nodes, frame)
         draw_center(stdscr, frame, phase)
         for node in nodes:
             draw_node(stdscr, node, frame)
-        draw_log_panel(stdscr, frame, phase)
+        draw_firewall_panel(stdscr, frame, nodes)
+        draw_log_panel(stdscr, frame, phase, extra_log)
         draw_footer(stdscr, nodes, frame)
-
         stdscr.refresh()
+
         frame += 1
 
-        # Nach Abschluss kurz stehen lassen
-        if frame > 110:
-            time.sleep(0.5)
-            frame = 96   # Loop ab "FULLY ACTIVE"
+        # Loop ab "FULLY ACTIVE"
+        if frame > 115:
+            time.sleep(0.8)
+            frame = 96
+
+    stop_backend_poll()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
