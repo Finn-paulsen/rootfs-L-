@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+hydra-heartbeat  —  Node Heartbeat Sender
+Project Hydra  ·  NRF24-Gateway-01
+
+Sendet alle 60 Sekunden einen Heartbeat an den DATA-RELAY (Futro S930).
+Läuft als systemd-Service oder direkt im Hintergrund.
+
+Einrichten als Service:
+  sudo cp /usr/local/bin/hydra-heartbeat /usr/local/bin/hydra-heartbeat
+  sudo systemctl enable hydra-heartbeat
+  sudo systemctl start hydra-heartbeat
+"""
+
+import time
+import socket
+import subprocess
+import sys
+import os
+import logging
+
+# ── Konfiguration ────────────────────────────────────────────────────────────
+BACKEND_URL  = "http://192.168.178.89:5000/hydra/heartbeat"
+NODE_ID      = "NRF24-GW-01"
+NODE_ROLE    = "rf-hub"
+INTERVAL_SEC = 60          # Heartbeat alle 60 Sekunden
+LOG_FILE     = "/var/log/hydra-heartbeat.log"
+RETRY_AFTER  = 15          # Sekunden warten bei Fehler
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  [%(levelname)s]  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger("hydra-heartbeat")
+
+
+def get_uptime() -> str:
+    """Uptime als lesbaren String."""
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+        d, r = divmod(int(secs), 86400)
+        h, r = divmod(r, 3600)
+        m, s = divmod(r, 60)
+        parts = []
+        if d: parts.append(f"{d}d")
+        if h: parts.append(f"{h}h")
+        if m: parts.append(f"{m}m")
+        parts.append(f"{s}s")
+        return " ".join(parts)
+    except Exception:
+        return "unknown"
+
+
+def get_ip() -> str:
+    """Eigene IP-Adresse ermitteln."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "unknown"
+
+
+def send_heartbeat() -> bool:
+    """Heartbeat per curl senden (kein requests nötig)."""
+    ip     = get_ip()
+    uptime = get_uptime()
+    payload = (
+        f'{{"node_id":"{NODE_ID}",'
+        f'"role":"{NODE_ROLE}",'
+        f'"ip":"{ip}",'
+        f'"uptime":"{uptime}"}}'
+    )
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", payload,
+                "--connect-timeout", "5",
+                "--max-time", "8",
+                BACKEND_URL,
+            ],
+            capture_output=True, text=True, timeout=12
+        )
+        http_code = result.stdout.strip()
+        if http_code == "200":
+            log.info(f"Heartbeat OK  ·  IP={ip}  ·  Uptime={uptime}")
+            return True
+        else:
+            log.warning(f"Heartbeat NOK  ·  HTTP {http_code}")
+            return False
+    except subprocess.TimeoutExpired:
+        log.warning("Heartbeat timeout")
+        return False
+    except Exception as e:
+        log.warning(f"Heartbeat error: {e}")
+        return False
+
+
+def main():
+    log.info(f"hydra-heartbeat gestartet  ·  Node={NODE_ID}  ·  Backend={BACKEND_URL}")
+    consecutive_failures = 0
+
+    while True:
+        success = send_heartbeat()
+        if success:
+            consecutive_failures = 0
+            time.sleep(INTERVAL_SEC)
+        else:
+            consecutive_failures += 1
+            wait = RETRY_AFTER * min(consecutive_failures, 4)
+            log.info(f"Retry in {wait}s  (Fehler #{consecutive_failures})")
+            time.sleep(wait)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,257 @@
+#!/bin/bash
+# hydra-menu  —  Hydra Control Interface
+# Project Hydra  ·  NRF24-Gateway-01
+# Aufruf: hydra-menu
+
+# ── Farben ───────────────────────────────────────────────────────────────────
+G='\033[0;32m'
+Y='\033[1;33m'
+R='\033[0;31m'
+C='\033[0;36m'
+B='\033[1m'
+D='\033[2m'
+NC='\033[0m'
+
+BACKEND_IP="192.168.178.89"
+BACKEND_URL="http://${BACKEND_IP}:5000"
+LOG_FILE="/var/log/hydra-heartbeat.log"
+
+# ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+header() {
+    clear
+    echo -e "${B}Project Hydra  ·  NRF24-Gateway-01${NC}"
+    echo -e "${D}RF-Hub / Data Relay Node  ·  Control Interface${NC}"
+    echo -e "${D}─────────────────────────────────────────────${NC}"
+    echo ""
+}
+
+press_enter() {
+    echo ""
+    echo -e "${D}[Enter] Zurück zum Menü${NC}"
+    read -r
+}
+
+check_backend_reachable() {
+    ping -c1 -W2 "$BACKEND_IP" >/dev/null 2>&1
+}
+
+# ── Menüpunkte ───────────────────────────────────────────────────────────────
+
+menu_status() {
+    header
+    echo -e "${Y}── Node-Status (live)${NC}"
+    echo ""
+    /etc/update-motd.d/10-hydra-status
+    press_enter
+}
+
+menu_backend_status() {
+    header
+    echo -e "${Y}── DATA-RELAY Status${NC}"
+    echo ""
+    if check_backend_reachable; then
+        echo -e "  Ping:   [ ${G}OK${NC} ]"
+        echo ""
+        # Versuche /hydra/status abzufragen
+        RESPONSE=$(curl -s --connect-timeout 4 --max-time 6 "${BACKEND_URL}/hydra/status" 2>/dev/null)
+        if [ -n "$RESPONSE" ]; then
+            echo -e "${Y}  Backend-Info:${NC}"
+            # Felder parsen (kein jq nötig, einfaches grep)
+            NODE=$(echo "$RESPONSE"    | grep -o '"node":"[^"]*"'    | cut -d'"' -f4)
+            UPTIME=$(echo "$RESPONSE"  | grep -o '"uptime":"[^"]*"'  | cut -d'"' -f4)
+            KNOWN=$(echo "$RESPONSE"   | grep -o '"known_nodes":[0-9]*' | grep -o '[0-9]*')
+            ACTIVE=$(echo "$RESPONSE"  | grep -o '"active_nodes":[0-9]*' | grep -o '[0-9]*')
+            TS=$(echo "$RESPONSE"      | grep -o '"timestamp":"[^"]*"' | cut -d'"' -f4)
+            echo -e "  Node:          ${G}${NODE:-DATA-RELAY}${NC}"
+            echo -e "  Uptime:        ${G}${UPTIME:-?}${NC}"
+            echo -e "  Known nodes:   ${G}${KNOWN:-?}${NC}"
+            echo -e "  Active nodes:  ${G}${ACTIVE:-?}${NC}"
+            echo -e "  Timestamp:     ${D}${TS:-?}${NC}"
+        else
+            echo -e "  API:    [ ${Y}NICHT ERREICHBAR${NC} ]"
+            echo -e "  ${D}(Backend läuft möglicherweise nicht auf Port 5000)${NC}"
+        fi
+    else
+        echo -e "  Ping:   [ ${R}FAILED${NC} ]"
+        echo -e "  ${D}DATA-RELAY (${BACKEND_IP}) nicht erreichbar.${NC}"
+    fi
+    press_enter
+}
+
+menu_send_event() {
+    header
+    echo -e "${Y}── Testpaket an DATA-RELAY senden${NC}"
+    echo ""
+    if ! check_backend_reachable; then
+        echo -e "  ${R}DATA-RELAY nicht erreichbar. Abbruch.${NC}"
+        press_enter
+        return
+    fi
+    echo -e "  Sende Testpaket an ${BACKEND_URL}/event ..."
+    echo ""
+    RESPONSE=$(curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"device":"NRF24-GW-01","type":"test","value":1}' \
+        --connect-timeout 4 --max-time 6 \
+        "${BACKEND_URL}/event" 2>/dev/null)
+    if echo "$RESPONSE" | grep -q '"ok"'; then
+        echo -e "  Status: [ ${G}OK${NC} ]  —  Backend hat geantwortet"
+        echo -e "  Response: ${D}${RESPONSE}${NC}"
+    else
+        echo -e "  Status: [ ${R}FAILED${NC} ]"
+        echo -e "  Response: ${D}${RESPONSE:-keine Antwort}${NC}"
+    fi
+    press_enter
+}
+
+menu_heartbeat_log() {
+    header
+    echo -e "${Y}── Heartbeat-Log (letzte 20 Einträge)${NC}"
+    echo ""
+    if [ -f "$LOG_FILE" ]; then
+        tail -20 "$LOG_FILE" | while IFS= read -r line; do
+            if echo "$line" | grep -q "OK"; then
+                echo -e "  ${G}${line}${NC}"
+            elif echo "$line" | grep -q "NOK\|error\|warning\|timeout\|Fehler"; then
+                echo -e "  ${R}${line}${NC}"
+            else
+                echo -e "  ${D}${line}${NC}"
+            fi
+        done
+    else
+        echo -e "  ${D}Keine Log-Datei gefunden: ${LOG_FILE}${NC}"
+        echo -e "  ${D}Heartbeat-Service läuft möglicherweise noch nicht.${NC}"
+        echo ""
+        echo -e "  Starten mit:"
+        echo -e "  ${C}sudo systemctl enable --now hydra-heartbeat${NC}"
+    fi
+    press_enter
+}
+
+menu_heartbeat_service() {
+    header
+    echo -e "${Y}── Heartbeat-Service${NC}"
+    echo ""
+    STATUS=$(systemctl is-active hydra-heartbeat 2>/dev/null)
+    ENABLED=$(systemctl is-enabled hydra-heartbeat 2>/dev/null)
+    if [ "$STATUS" = "active" ]; then
+        echo -e "  Service:  [ ${G}ACTIVE${NC} ]"
+    else
+        echo -e "  Service:  [ ${R}${STATUS:-UNKNOWN}${NC} ]"
+    fi
+    echo -e "  Autostart: ${D}${ENABLED:-disabled}${NC}"
+    echo ""
+    echo -e "  ${Y}Optionen:${NC}"
+    echo -e "  ${B}1${NC}  Service starten"
+    echo -e "  ${B}2${NC}  Service stoppen"
+    echo -e "  ${B}3${NC}  Autostart aktivieren"
+    echo -e "  ${B}0${NC}  Zurück"
+    echo ""
+    read -rp "  > " sub
+    case "$sub" in
+        1) sudo systemctl start hydra-heartbeat && echo -e "  ${G}Gestartet.${NC}" ;;
+        2) sudo systemctl stop hydra-heartbeat  && echo -e "  ${Y}Gestoppt.${NC}" ;;
+        3) sudo systemctl enable hydra-heartbeat && echo -e "  ${G}Autostart aktiviert.${NC}" ;;
+    esac
+    press_enter
+}
+
+menu_nodes() {
+    header
+    echo -e "${Y}── Registrierte Nodes (DATA-RELAY)${NC}"
+    echo ""
+    if ! check_backend_reachable; then
+        echo -e "  ${R}DATA-RELAY nicht erreichbar.${NC}"
+        press_enter
+        return
+    fi
+    RESPONSE=$(curl -s --connect-timeout 4 --max-time 6 \
+        "${BACKEND_URL}/hydra/nodes" 2>/dev/null)
+    if [ -z "$RESPONSE" ]; then
+        echo -e "  ${Y}API nicht erreichbar (Port 5000).${NC}"
+        press_enter
+        return
+    fi
+    COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+    echo -e "  Bekannte Nodes: ${G}${COUNT:-0}${NC}"
+    echo ""
+    # Jeden node_id ausgeben
+    echo "$RESPONSE" | grep -o '"node_id":"[^"]*"' | cut -d'"' -f4 | while read -r nid; do
+        echo -e "  ${C}·${NC} ${nid}"
+    done
+    press_enter
+}
+
+menu_hydra_net() {
+    header
+    echo -e "${Y}── Hive-Mind Cluster Visualizer${NC}"
+    echo ""
+    echo -e "  Startet ${B}hydra-net${NC} — animierte Cluster-Simulation."
+    echo -e "  ${D}Passwort erforderlich.${NC}"
+    echo ""
+    read -rp "  Fortfahren? [j/N] " confirm
+    if [[ "$confirm" =~ ^[jJyY]$ ]]; then
+        /usr/local/bin/hydra-net
+    fi
+}
+
+menu_rf_info() {
+    header
+    echo -e "${Y}── RF-Modul Info (NRF24L01+)${NC}"
+    echo ""
+    echo -e "  Modul:        ${G}NRF24L01+${NC}"
+    echo -e "  Interface:    ${G}SPI0${NC}  (GPIO CE=25, CSN=8)"
+    echo -e "  Kanal:        ${G}76${NC}  (2.476 GHz)"
+    echo -e "  Datenrate:    ${G}1 Mbps${NC}"
+    echo -e "  PA-Level:     ${G}HIGH${NC}"
+    echo -e "  Adresse:      ${G}0xE7E7E7E7E7${NC}"
+    echo ""
+    # SPI prüfen
+    if ls /dev/spidev* >/dev/null 2>&1; then
+        echo -e "  SPI:          [ ${G}ACTIVE${NC} ]"
+    else
+        echo -e "  SPI:          [ ${Y}DISABLED${NC} ]  — dtparam=spi=on in /boot/firmware/config.txt"
+    fi
+    # lsmod
+    if lsmod 2>/dev/null | grep -qi "spi\|nrf"; then
+        echo -e "  Kernel-Modul: [ ${G}GELADEN${NC} ]"
+    else
+        echo -e "  Kernel-Modul: [ ${Y}NICHT GELADEN${NC} ]"
+    fi
+    press_enter
+}
+
+# ── Hauptmenü ────────────────────────────────────────────────────────────────
+main_menu() {
+    while true; do
+        header
+        echo -e "${Y}Menü${NC}"
+        echo ""
+        echo -e "  ${B}1${NC}  Node-Status anzeigen"
+        echo -e "  ${B}2${NC}  DATA-RELAY Status abfragen"
+        echo -e "  ${B}3${NC}  Testpaket senden"
+        echo -e "  ${B}4${NC}  Heartbeat-Log anzeigen"
+        echo -e "  ${B}5${NC}  Heartbeat-Service verwalten"
+        echo -e "  ${B}6${NC}  Registrierte Nodes (Cluster)"
+        echo -e "  ${B}7${NC}  RF-Modul Info"
+        echo -e "  ${B}8${NC}  Hive-Mind Visualizer  ${D}[Passwort]${NC}"
+        echo ""
+        echo -e "  ${B}0${NC}  Beenden"
+        echo ""
+        read -rp "  > " choice
+        case "$choice" in
+            1) menu_status ;;
+            2) menu_backend_status ;;
+            3) menu_send_event ;;
+            4) menu_heartbeat_log ;;
+            5) menu_heartbeat_service ;;
+            6) menu_nodes ;;
+            7) menu_rf_info ;;
+            8) menu_hydra_net ;;
+            0) echo ""; exit 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+main_menu

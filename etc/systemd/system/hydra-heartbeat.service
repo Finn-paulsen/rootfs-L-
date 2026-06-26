@@ -1,0 +1,15 @@
+[Unit]
+Description=Hydra Node Heartbeat  —  NRF24-Gateway-01
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/hydra-heartbeat
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/var/log/hydra-heartbeat.log
+StandardError=append:/var/log/hydra-heartbeat.log
+
+[Install]
+WantedBy=multi-user.target
