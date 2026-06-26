@@ -1,13 +1,3 @@
-\e[1;32m
-   ____  _____   __  __   ____   ___   ____  ____  ____  
-  / ___|/ _ \ \ / /  \ \ / / /  / _ \ / ___|/ ___||  _ \ 
- | |  _| | | \ V /____\ V / /  | | | | |  _| |  _ | |_) |
- | |_| | |_| || |_____|| | /___| |_| | |_| | |_| ||  _ < 
-  \____|\___/ |_|      |_|/____|\___/ \____|\____||_| \_\
-\e[0m
-\e[1;33mGOV-ARCHIVE INFORMATION GRID - CLASSIFIED ACCESS INTERFACE\e[0m
-\e[0;32mNODE ID:\e[0m NRF24-GATEWAY-01
-\e[0;32mROLE:\e[0m RF-HUB / DATA RELAY NODE
-
-\e[0;31mUNAUTHORIZED ACCESS IS STRICTLY PROHIBITED AND WILL BE LOGGED.\e[0m
+Project Hydra  —  NRF24-Gateway-01
+RF-Hub / Data Relay Node
 

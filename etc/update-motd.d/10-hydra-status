@@ -1,46 +1,62 @@
 #!/bin/bash
 
-# Farben definieren (Retro-Futuristisch, ähnlich Hydra CSS)
 GREEN='\033[0;32m'
-DARK_GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+BOLD='\033[1m'
+NC='\033[0m'
 
-# Systeminformationen abrufen
 UPTIME=$(uptime -p | cut -d " " -f 2-)
 KERNEL=$(uname -r)
 IP_ADDR=$(hostname -I | awk '{print $1}')
+LOAD=$(cut -d ' ' -f1 /proc/loadavg)
+MEM_TOTAL=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
+MEM_FREE=$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)
+MEM_USED=$((MEM_TOTAL - MEM_FREE))
 
-echo -e "${DARK_GREEN}#################################################################${NC}"
-echo -e "${DARK_GREEN}#${NC}                                                               ${DARK_GREEN}#${NC}"
-echo -e "${DARK_GREEN}#${NC}  ${GREEN}GOV-ARCHIVE INFORMATION GRID${NC}                                 ${DARK_GREEN}#${NC}"
-echo -e "${DARK_GREEN}#${NC}  ${GREEN}CLASSIFIED ACCESS INTERFACE${NC}                                  ${DARK_GREEN}#${NC}"
-echo -e "${DARK_GREEN}#${NC}                                                               ${DARK_GREEN}#${NC}"
-echo -e "${DARK_GREEN}#################################################################${NC}"
 echo ""
-echo -e "${YELLOW}SYSTEM IDENTIFICATION:${NC}"
-echo -e "  NODE ID:     ${GREEN}NRF24-GATEWAY-01${NC}"
-echo -e "  ROLE:        ${GREEN}RF-HUB / DATA RELAY NODE${NC}"
-echo -e "  UPTIME:      ${GREEN}${UPTIME}${NC}"
-echo -e "  KERNEL:      ${GREEN}${KERNEL}${NC}"
-echo -e "  NETWORK:     ${GREEN}${IP_ADDR}${NC}"
+echo -e "${BOLD}Project Hydra  —  NRF24-Gateway-01${NC}"
+echo -e "RF-Hub / Data Relay Node"
 echo ""
-echo -e "${YELLOW}HARDWARE STATUS:${NC}"
-echo -e "  CPU:                 [ ${GREEN}OK${NC} ]"
-echo -e "  RAM:                 [ ${GREEN}OK${NC} ]"
-echo -e "  STORAGE:             [ ${GREEN}OK${NC} ]"
-echo -e "  NETWORK INTERFACE:   [ ${GREEN}OK${NC} ]"
-echo -e "  RF-MODULE (NRF24):   [ ${GREEN}SYNC ACTIVE${NC} ]"
+echo -e "${YELLOW}System${NC}"
+echo -e "  Uptime:    ${UPTIME}"
+echo -e "  Kernel:    ${KERNEL}"
+echo -e "  IP:        ${IP_ADDR}"
+echo -e "  Load:      ${LOAD}"
+echo -e "  Memory:    ${MEM_USED} MB used / ${MEM_TOTAL} MB total"
 echo ""
-echo -e "${YELLOW}SECURITY LAYER:${NC}"
-echo -e "  ENCRYPTION:          [ ${GREEN}ACTIVE${NC} ]"
-echo -e "  AUTH CHANNEL:        [ ${GREEN}SECURE${NC} ]"
-echo -e "  INTEGRITY CHECK:     [ ${GREEN}PASSED${NC} ]"
+echo -e "${YELLOW}Hardware${NC}"
+echo -e "  CPU ............ [ ${GREEN}OK${NC} ]"
+echo -e "  RAM ............ [ ${GREEN}OK${NC} ]"
+echo -e "  Storage ........ [ ${GREEN}OK${NC} ]"
+echo -e "  Network ........ [ ${GREEN}OK${NC} ]"
+echo -e "  RF-Module (NRF24L01+) ... [ ${GREEN}SYNC ACTIVE${NC} ]"
 echo ""
-echo -e "${YELLOW}NETWORK STATUS:${NC}"
-# Backend Check aufrufen
+echo -e "${YELLOW}Services${NC}"
+
+# Python3 vorhanden?
+if command -v python3 >/dev/null 2>&1; then
+    PY_VER=$(python3 --version 2>&1 | awk '{print $2}')
+    echo -e "  python3 ........ [ ${GREEN}${PY_VER}${NC} ]"
+else
+    echo -e "  python3 ........ [ ${RED}NOT FOUND${NC} ]"
+fi
+
+# RF-Skript vorhanden?
+if [ -f /home/finn/hydra/hub/send_test.py ]; then
+    echo -e "  hub/send_test .. [ ${GREEN}PRESENT${NC} ]"
+else
+    echo -e "  hub/send_test .. [ ${RED}MISSING${NC} ]"
+fi
+
+# SPI-Interface aktiv?
+if ls /dev/spidev* >/dev/null 2>&1; then
+    echo -e "  SPI interface .. [ ${GREEN}ACTIVE${NC} ]"
+else
+    echo -e "  SPI interface .. [ ${YELLOW}DISABLED${NC} ]"
+fi
+
+echo ""
+echo -e "${YELLOW}Network${NC}"
 /usr/local/bin/check_backend.sh
 echo ""
-echo -e "${DARK_GREEN}=================================================================${NC}"
-echo -e "${GREEN}SYSTEM READY. TYPE COMMAND TO PROCEED.${NC}"
