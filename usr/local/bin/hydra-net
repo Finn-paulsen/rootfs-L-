@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+hydra-net  —  Hive-Mind Cluster Visualizer
+Project Hydra  ·  NRF24-Gateway-01
+
+Rein visuelle, fiktive Simulation eines Bot-Clusters.
+Keinerlei echte Netzwerkaktionen.
+"""
+
+import curses
+import time
+import random
+import math
+import sys
+import hashlib
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Passwort (SHA-256-Hash von "hydra")
+# Zum Ändern: python3 -c "import hashlib; print(hashlib.sha256(b'DEINPASSWORT').hexdigest())"
+PASSWORD_HASH = hashlib.sha256(b"hydra").hexdigest()
+
+# Anzahl der simulierten Nodes (10–30 für Pi 2)
+NODE_COUNT = 20
+
+# Frames pro Sekunde (niedrig halten für Pi 2)
+FPS = 12
+
+# Domain-Controller (Ziel der Fake-Infiltration)
+DC_NAME = "DC-HYDRA-CORE"
+DC_IP   = "10.0.0.1"
+
+# Bekannte echte Nodes (werden bevorzugt angezeigt)
+REAL_NODES = [
+    {"id": "NRF24-GW-01",  "ip": "192.168.178.xx",  "role": "RF-HUB"},
+    {"id": "DATA-RELAY",   "ip": "192.168.178.89",   "role": "BACKEND"},
+]
+
+# Fake-Node-Namen-Pool
+FAKE_NODE_PREFIXES = [
+    "NODE", "BOT", "AGENT", "CELL", "UNIT", "RELAY", "PROBE", "DRONE"
+]
+FAKE_NODE_SUFFIXES = [
+    "A1","B2","C3","D4","E5","F6","G7","H8",
+    "X1","X2","X3","X4","X5","X6","X7","X8",
+    "01","02","03","04","05","06","07","08",
+]
+
+# Farb-IDs (werden in init_colors() belegt)
+C_DEFAULT  = 0
+C_GREEN    = 1
+C_YELLOW   = 2
+C_RED      = 3
+C_CYAN     = 4
+C_WHITE    = 5
+C_DIM      = 6
+C_MAGENTA  = 7
+
+# Node-Zustände
+STATE_INIT     = "INIT"
+STATE_SCANNING = "SCAN"
+STATE_LINKING  = "LINK"
+STATE_ONLINE   = "ONLN"
+STATE_SYNC     = "SYNC"
+STATE_ACTIVE   = "ACTV"
+STATE_OFFLINE  = "OFFL"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HILFSFUNKTIONEN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_colors():
+    """Curses-Farbpaare initialisieren."""
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_GREEN,   curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_YELLOW,  curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_RED,     curses.COLOR_RED,     -1)
+    curses.init_pair(C_CYAN,    curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_WHITE,   curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_DIM,     curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_MAGENTA, curses.COLOR_MAGENTA, -1)
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    """addstr ohne Absturz bei Randüberschreitung."""
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0:
+        return
+    max_len = w - x - 1
+    if max_len <= 0:
+        return
+    try:
+        win.addstr(y, x, text[:max_len], attr)
+    except curses.error:
+        pass
+
+
+def draw_box(win, y, x, h, w, color_pair=C_DIM, title=""):
+    """Einfache Box zeichnen."""
+    attr = curses.color_pair(color_pair)
+    # Ecken
+    safe_addstr(win, y,     x,     "╔", attr)
+    safe_addstr(win, y,     x+w-1, "╗", attr)
+    safe_addstr(win, y+h-1, x,     "╚", attr)
+    safe_addstr(win, y+h-1, x+w-1, "╝", attr)
+    # Horizontale Linien
+    for i in range(1, w-1):
+        safe_addstr(win, y,     x+i, "═", attr)
+        safe_addstr(win, y+h-1, x+i, "═", attr)
+    # Vertikale Linien
+    for i in range(1, h-1):
+        safe_addstr(win, y+i, x,     "║", attr)
+        safe_addstr(win, y+i, x+w-1, "║", attr)
+    # Titel
+    if title:
+        t = f" {title} "
+        tx = x + max(1, (w - len(t)) // 2)
+        safe_addstr(win, y, tx, t, attr | curses.A_BOLD)
+
+
+def state_color(state):
+    """Farbe je nach Node-Zustand."""
+    return {
+        STATE_INIT:     C_DIM,
+        STATE_SCANNING: C_YELLOW,
+        STATE_LINKING:  C_YELLOW,
+        STATE_ONLINE:   C_GREEN,
+        STATE_SYNC:     C_CYAN,
+        STATE_ACTIVE:   C_GREEN,
+        STATE_OFFLINE:  C_RED,
+    }.get(state, C_DIM)
+
+
+def fake_ip():
+    return f"10.{random.randint(0,9)}.{random.randint(0,99)}.{random.randint(2,254)}"
+
+
+def fake_id():
+    p = random.choice(FAKE_NODE_PREFIXES)
+    s = random.choice(FAKE_NODE_SUFFIXES)
+    return f"{p}-{s}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASSWORT-GATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOGO = [
+    r"  ██╗  ██╗██╗   ██╗██████╗ ██████╗  █████╗ ",
+    r"  ██║  ██║╚██╗ ██╔╝██╔══██╗██╔══██╗██╔══██╗",
+    r"  ███████║ ╚████╔╝ ██║  ██║██████╔╝███████║",
+    r"  ██╔══██║  ╚██╔╝  ██║  ██║██╔══██╗██╔══██║",
+    r"  ██║  ██║   ██║   ██████╔╝██║  ██║██║  ██║",
+    r"  ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝",
+]
+
+def password_gate(stdscr):
+    """Passwort-Eingabe vor dem Start. Gibt True zurück wenn korrekt."""
+    curses.curs_set(1)
+    curses.echo()
+    h, w = stdscr.getmaxyx()
+    stdscr.clear()
+
+    # Logo
+    logo_y = max(1, h // 2 - 8)
+    for i, line in enumerate(LOGO):
+        x = max(0, (w - len(line)) // 2)
+        safe_addstr(stdscr, logo_y + i, x, line,
+                    curses.color_pair(C_GREEN) | curses.A_BOLD)
+
+    subtitle = "HIVE-MIND CLUSTER INTERFACE  ·  CLASSIFIED"
+    safe_addstr(stdscr, logo_y + len(LOGO) + 1,
+                max(0, (w - len(subtitle)) // 2), subtitle,
+                curses.color_pair(C_YELLOW))
+
+    sep = "─" * min(44, w - 4)
+    safe_addstr(stdscr, logo_y + len(LOGO) + 2,
+                max(0, (w - len(sep)) // 2), sep,
+                curses.color_pair(C_DIM))
+
+    prompt_y = logo_y + len(LOGO) + 4
+    attempts = 3
+
+    for attempt in range(attempts):
+        safe_addstr(stdscr, prompt_y, max(0, (w - 36) // 2),
+                    "  ADMIN PASSPHRASE REQUIRED           ",
+                    curses.color_pair(C_DIM))
+        safe_addstr(stdscr, prompt_y + 1, max(0, (w - 36) // 2),
+                    "  > ",
+                    curses.color_pair(C_GREEN) | curses.A_BOLD)
+
+        # Passwort unsichtbar einlesen
+        curses.noecho()
+        curses.curs_set(1)
+        stdscr.move(prompt_y + 1, max(0, (w - 36) // 2) + 4)
+        stdscr.refresh()
+
+        pw = ""
+        while True:
+            ch = stdscr.getch()
+            if ch in (10, 13):  # Enter
+                break
+            elif ch in (127, curses.KEY_BACKSPACE, 8):
+                if pw:
+                    pw = pw[:-1]
+                    cy, cx = stdscr.getyx()
+                    safe_addstr(stdscr, cy, cx - 1, " ")
+                    stdscr.move(cy, cx - 1)
+            elif 32 <= ch <= 126:
+                pw += chr(ch)
+                safe_addstr(stdscr, prompt_y + 1,
+                             max(0, (w - 36) // 2) + 4 + len(pw) - 1,
+                             "●", curses.color_pair(C_GREEN))
+
+        entered_hash = hashlib.sha256(pw.encode()).hexdigest()
+        if entered_hash == PASSWORD_HASH:
+            safe_addstr(stdscr, prompt_y + 3,
+                        max(0, (w - 36) // 2),
+                        "  AUTH VERIFIED  ·  ACCESS GRANTED    ",
+                        curses.color_pair(C_GREEN) | curses.A_BOLD)
+            stdscr.refresh()
+            time.sleep(1.2)
+            return True
+        else:
+            remaining = attempts - attempt - 1
+            msg = f"  AUTH FAILED  ·  {remaining} ATTEMPT(S) LEFT  "
+            safe_addstr(stdscr, prompt_y + 3,
+                        max(0, (w - 36) // 2), msg,
+                        curses.color_pair(C_RED) | curses.A_BOLD)
+            stdscr.refresh()
+            time.sleep(1.5)
+            # Zeile leeren für nächsten Versuch
+            safe_addstr(stdscr, prompt_y + 1,
+                        max(0, (w - 36) // 2),
+                        "  >                                   ",
+                        curses.color_pair(C_GREEN))
+            safe_addstr(stdscr, prompt_y + 3,
+                        max(0, (w - 36) // 2),
+                        "                                      ",
+                        curses.color_pair(C_DIM))
+
+    safe_addstr(stdscr, prompt_y + 3,
+                max(0, (w - 36) // 2),
+                "  ACCESS DENIED  ·  SESSION TERMINATED",
+                curses.color_pair(C_RED) | curses.A_BOLD)
+    stdscr.refresh()
+    time.sleep(2)
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE-DATENMODELL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Node:
+    def __init__(self, nid, ip, role="BOT", real=False):
+        self.id    = nid
+        self.ip    = ip
+        self.role  = role
+        self.real  = real
+        self.state = STATE_INIT
+        self.blink = False          # für Blink-Effekt
+        self.progress = 0           # 0–100 für Verbindungsaufbau
+        # Position im Cluster-Layout (wird später gesetzt)
+        self.cx = 0
+        self.cy = 0
+
+    def tick(self, frame):
+        """Zustandsübergänge simulieren."""
+        # Blink-Effekt für SYNC/SCANNING
+        self.blink = (frame % 6) < 3
+
+        if self.state == STATE_INIT and frame > random.randint(5, 25):
+            self.state = STATE_SCANNING
+        elif self.state == STATE_SCANNING:
+            self.progress = min(100, self.progress + random.randint(3, 12))
+            if self.progress >= 100:
+                self.state = STATE_LINKING
+                self.progress = 0
+        elif self.state == STATE_LINKING:
+            self.progress = min(100, self.progress + random.randint(5, 15))
+            if self.progress >= 100:
+                self.state = STATE_ONLINE
+                self.progress = 0
+        elif self.state == STATE_ONLINE:
+            self.state = STATE_SYNC
+        elif self.state == STATE_SYNC:
+            if frame % 20 == 0 and random.random() < 0.4:
+                self.state = STATE_ACTIVE
+
+
+def build_nodes(count):
+    """Node-Liste aufbauen: echte Nodes + Fake-Nodes."""
+    nodes = []
+    # Echte Nodes zuerst
+    for r in REAL_NODES:
+        nodes.append(Node(r["id"], r["ip"], r["role"], real=True))
+    # Fake-Nodes auffüllen
+    used_ids = {n.id for n in nodes}
+    while len(nodes) < count:
+        nid = fake_id()
+        if nid not in used_ids:
+            used_ids.add(nid)
+            nodes.append(Node(nid, fake_ip()))
+    return nodes
+
+
+def assign_positions(nodes, cx, cy, radius):
+    """Nodes kreisförmig um Mittelpunkt anordnen."""
+    n = len(nodes)
+    for i, node in enumerate(nodes):
+        angle = (2 * math.pi * i / n) - math.pi / 2
+        node.cx = int(cx + radius * math.cos(angle) * 2.2)  # *2.2 wegen Zeichenbreite
+        node.cy = int(cy + radius * math.sin(angle))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VERBINDUNGSLINIEN (Bresenham)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bresenham(x0, y0, x1, y1):
+    """Bresenham-Linie als Punktliste."""
+    pts = []
+    dx = abs(x1 - x0); dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        pts.append((x0, y0))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy; x0 += sx
+        if e2 < dx:
+            err += dx; y0 += sy
+    return pts
+
+
+def line_char(x0, y0, x1, y1):
+    """Passenden Liniencharakter für Richtung wählen."""
+    dx = x1 - x0; dy = y1 - y0
+    if dy == 0:
+        return "─"
+    if dx == 0:
+        return "│"
+    if (dx > 0 and dy < 0) or (dx < 0 and dy > 0):
+        return "╱"
+    return "╲"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HAUPT-VISUALISIERUNG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_header(win, frame):
+    """Titelzeile oben."""
+    h, w = win.getmaxyx()
+    blink_attr = curses.color_pair(C_GREEN) | curses.A_BOLD
+    if (frame % 8) < 4:
+        blink_attr = curses.color_pair(C_CYAN) | curses.A_BOLD
+
+    title = "  HYDRA  ·  HIVE-MIND CLUSTER  ·  LIVE OVERVIEW  "
+    safe_addstr(win, 0, 0, "═" * (w - 1), curses.color_pair(C_DIM))
+    safe_addstr(win, 0, max(0, (w - len(title)) // 2), title, blink_attr)
+
+
+def draw_footer(win, nodes, frame):
+    """Statuszeile unten."""
+    h, w = win.getmaxyx()
+    online  = sum(1 for n in nodes if n.state in (STATE_ONLINE, STATE_SYNC, STATE_ACTIVE))
+    synced  = sum(1 for n in nodes if n.state in (STATE_SYNC, STATE_ACTIVE))
+    total   = len(nodes)
+    ts      = time.strftime("%H:%M:%S")
+
+    safe_addstr(win, h - 2, 0, "═" * (w - 1), curses.color_pair(C_DIM))
+    status = (f"  NODES: {total} total  ·  {online} online  ·  "
+              f"{synced} synced  ·  {ts}  ·  [Q] quit  ")
+    safe_addstr(win, h - 1, 0, status, curses.color_pair(C_DIM))
+
+
+def draw_node(win, node, frame):
+    """Einzelnen Node als Box zeichnen."""
+    h, w = win.getmaxyx()
+    x, y = node.cx, node.cy
+    if y < 2 or y >= h - 4 or x < 1 or x >= w - 12:
+        return
+
+    state = node.state
+    col   = curses.color_pair(state_color(state))
+    dim   = curses.color_pair(C_DIM)
+
+    # Blink bei SCANNING/SYNC
+    if state in (STATE_SCANNING, STATE_SYNC) and not node.blink:
+        col = dim
+
+    # Node-Box (3 Zeilen)
+    label = node.id[:10]
+    safe_addstr(win, y,     x, f"[{label:<10}]", col | curses.A_BOLD)
+    safe_addstr(win, y + 1, x, f" {state} ", col)
+
+    # Fortschrittsbalken bei SCANNING/LINKING
+    if state in (STATE_SCANNING, STATE_LINKING):
+        bar_w = 10
+        filled = int(node.progress / 100 * bar_w)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        safe_addstr(win, y + 1, x + 1, bar, curses.color_pair(C_YELLOW))
+
+
+def draw_connections(win, nodes, frame):
+    """Verbindungslinien zwischen aktiven Nodes und Zentrum zeichnen."""
+    h, w = win.getmaxyx()
+    cx = w // 2
+    cy = (h - 2) // 2
+
+    active_states = (STATE_ONLINE, STATE_SYNC, STATE_ACTIVE)
+
+    for node in nodes:
+        if node.state not in active_states:
+            continue
+
+        pts = bresenham(node.cx + 6, node.cy, cx, cy)
+        # Nur jeden 2. Punkt zeichnen (Performance + Optik)
+        for i, (px, py) in enumerate(pts[2:-2]):
+            if i % 2 != 0:
+                continue
+            if py < 2 or py >= h - 2 or px < 1 or px >= w - 1:
+                continue
+            # Animiertes "Fließen" entlang der Linie
+            flow_offset = (frame + i) % 8
+            if flow_offset < 2:
+                ch_attr = curses.color_pair(C_CYAN) | curses.A_BOLD
+            else:
+                ch_attr = curses.color_pair(C_DIM)
+
+            lc = line_char(node.cx + 6, node.cy, cx, cy)
+            try:
+                win.addch(py, px, lc, ch_attr)
+            except curses.error:
+                pass
+
+
+def draw_center(win, frame, phase):
+    """Zentrum: Domain-Controller / Hydra-Core."""
+    h, w = win.getmaxyx()
+    cx = w // 2 - 9
+    cy = (h - 2) // 2 - 1
+
+    if phase < 3:
+        col = curses.color_pair(C_YELLOW) | curses.A_BOLD
+        label = f"  {DC_NAME}  "
+        sub   = f"  {DC_IP}   "
+        status = "  SCANNING...  " if (frame % 8) < 4 else "  PROBING...   "
+    elif phase < 5:
+        col = curses.color_pair(C_MAGENTA) | curses.A_BOLD
+        label = f"  {DC_NAME}  "
+        sub   = f"  {DC_IP}   "
+        status = "  INFILTRATING " if (frame % 6) < 3 else "  ESCALATING...  "
+    else:
+        col = curses.color_pair(C_GREEN) | curses.A_BOLD
+        label = f"  {DC_NAME}  "
+        sub   = f"  {DC_IP}   "
+        status = "  COMPROMISED  "
+
+    draw_box(win, cy - 1, cx, 5, 20,
+             C_MAGENTA if phase >= 3 else C_YELLOW,
+             "TARGET")
+    safe_addstr(win, cy,     cx + 1, label,  col)
+    safe_addstr(win, cy + 1, cx + 1, sub,    curses.color_pair(C_DIM))
+    safe_addstr(win, cy + 2, cx + 1, status, col)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INFILTRATIONS-SEQUENZ (rechte Spalte)
+# ─────────────────────────────────────────────────────────────────────────────
+
+INFIL_STEPS = [
+    (0,  C_DIM,     "Initializing cluster..."),
+    (8,  C_YELLOW,  "Scanning target network..."),
+    (16, C_YELLOW,  "Mapping domain topology..."),
+    (24, C_YELLOW,  "Identifying DC: " + DC_IP),
+    (32, C_CYAN,    "Establishing encrypted tunnel..."),
+    (40, C_CYAN,    "Injecting auth probe..."),
+    (48, C_MAGENTA, "Accessing Domain Controller..."),
+    (56, C_MAGENTA, "Privilege escalation in progress..."),
+    (64, C_MAGENTA, "Bypassing ACL restrictions..."),
+    (72, C_RED,     "ALERT: Firewall response detected"),
+    (76, C_MAGENTA, "Rerouting via secondary nodes..."),
+    (84, C_GREEN,   "Cluster synchronized."),
+    (90, C_GREEN,   "Domain Controller: COMPROMISED"),
+    (96, C_GREEN,   "Hydra-Cluster: FULLY ACTIVE"),
+]
+
+def draw_log_panel(win, frame, phase):
+    """Rechte Spalte: Infiltrations-Log."""
+    h, w = win.getmaxyx()
+    panel_w = min(36, w // 3)
+    px = w - panel_w - 1
+    py = 2
+
+    draw_box(win, py - 1, px, h - py - 2, panel_w, C_DIM, "CLUSTER LOG")
+
+    max_lines = h - py - 4
+    visible = []
+    for (trigger, color, text) in INFIL_STEPS:
+        if frame >= trigger:
+            visible.append((color, text))
+
+    # Nur die letzten max_lines anzeigen
+    visible = visible[-max_lines:]
+
+    for i, (color, text) in enumerate(visible):
+        is_last = (i == len(visible) - 1)
+        attr = curses.color_pair(color)
+        if is_last:
+            attr |= curses.A_BOLD
+        prefix = "▶ " if is_last else "  "
+        safe_addstr(win, py + i, px + 2,
+                    (prefix + text)[: panel_w - 4], attr)
+
+    # Fortschrittsbalken unten im Panel
+    bar_y = h - py - 3
+    progress = min(100, int(frame / 100 * 100))
+    bar_w = panel_w - 6
+    filled = int(progress / 100 * bar_w)
+    bar = "█" * filled + "░" * (bar_w - filled)
+    safe_addstr(win, bar_y, px + 2,
+                f"{progress:3d}% {bar}", curses.color_pair(C_GREEN))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE-LOGIK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_phase(frame):
+    """Simulationsphase aus Frame ableiten."""
+    if frame < 30:  return 1   # Initialisierung
+    if frame < 60:  return 2   # Scanning
+    if frame < 80:  return 3   # Infiltration beginnt
+    if frame < 95:  return 4   # Eskalation
+    return 5                   # Kompromittiert
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HAUPTSCHLEIFE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_simulation(stdscr):
+    """Haupt-Animations-Loop."""
+    init_colors()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000 // FPS)
+
+    # Passwort-Gate
+    if not password_gate(stdscr):
+        return
+
+    # Nodes aufbauen
+    nodes = build_nodes(NODE_COUNT)
+
+    # Positionen berechnen
+    h, w = stdscr.getmaxyx()
+    panel_w = min(36, w // 3)
+    usable_w = w - panel_w - 2
+    cx = usable_w // 2
+    cy = (h - 2) // 2
+    radius = min(cx - 14, cy - 4, 14)
+    assign_positions(nodes, cx, cy, radius)
+
+    # Zufälligen Start-Frame-Offset pro Node
+    for i, node in enumerate(nodes):
+        node._start_frame = random.randint(0, 20)
+
+    frame = 0
+
+    while True:
+        # Eingabe prüfen
+        key = stdscr.getch()
+        if key in (ord('q'), ord('Q')):
+            break
+
+        # Terminal-Größe neu einlesen (Resize-Handling)
+        h, w = stdscr.getmaxyx()
+        panel_w = min(36, w // 3)
+        usable_w = w - panel_w - 2
+        cx = usable_w // 2
+        cy = (h - 2) // 2
+        radius = min(cx - 14, cy - 4, 14)
+        assign_positions(nodes, cx, cy, radius)
+
+        phase = get_phase(frame)
+
+        # Nodes ticken lassen
+        for node in nodes:
+            if frame >= node._start_frame:
+                node.tick(frame - node._start_frame)
+
+        # Bildschirm aufbauen
+        stdscr.erase()
+        draw_header(stdscr, frame)
+        draw_connections(stdscr, nodes, frame)
+        draw_center(stdscr, frame, phase)
+        for node in nodes:
+            draw_node(stdscr, node, frame)
+        draw_log_panel(stdscr, frame, phase)
+        draw_footer(stdscr, nodes, frame)
+
+        stdscr.refresh()
+        frame += 1
+
+        # Nach Abschluss kurz stehen lassen
+        if frame > 110:
+            time.sleep(0.5)
+            frame = 96   # Loop ab "FULLY ACTIVE"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EINSTIEGSPUNKT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    try:
+        curses.wrapper(run_simulation)
+    except KeyboardInterrupt:
+        pass
+    print("\nHydra-Net terminated.\n")
+
+
+if __name__ == "__main__":
+    main()
