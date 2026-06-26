@@ -1,0 +1,58 @@
+#!/bin/bash
+
+GREEN='\033[0;32m'
+DARK_GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Tipp-Effekt Funktion
+type_text() {
+    text="$1"
+    delay="${2:-0.03}"
+    for (( i=0; i<${#text}; i++ )); do
+        echo -ne "${text:$i:1}"
+        sleep $delay
+    done
+    echo ""
+}
+
+clear
+type_text "${DARK_GREEN}BOOT SEQUENCE STARTED${NC}" 0.05
+sleep 0.5
+type_text "${YELLOW}CHECKING HARDWARE...${NC}" 0.03
+sleep 0.2
+echo -e "CPU: [ ${GREEN}OK${NC} ]"
+sleep 0.1
+echo -e "RAM: [ ${GREEN}OK${NC} ]"
+sleep 0.1
+echo -e "STORAGE: [ ${GREEN}OK${NC} ]"
+sleep 0.1
+echo -e "NETWORK INTERFACE: [ ${GREEN}OK${NC} ]"
+sleep 0.1
+echo -e "SECURITY MODULE: [ ${GREEN}OK${NC} ]"
+sleep 0.3
+
+type_text "${YELLOW}LOADING KERNEL MODULES...${NC}" 0.03
+sleep 0.2
+echo -e "[ ${GREEN}OK${NC} ] rf_nrf24_core"
+sleep 0.1
+echo -e "[ ${GREEN}OK${NC} ] crypto_vault_v3"
+sleep 0.1
+echo -e "[ ${GREEN}OK${NC} ] net_relay_bridge"
+sleep 0.3
+
+type_text "${YELLOW}INITIALIZING SECURITY LAYER...${NC}" 0.03
+sleep 0.2
+echo -e "ENCRYPTION: [ ${GREEN}ACTIVE${NC} ]"
+sleep 0.1
+echo -e "SESSION TOKEN: [ ${GREEN}GENERATED${NC} ]"
+sleep 0.1
+echo -e "AUTH CHANNEL: [ ${GREEN}SECURE${NC} ]"
+sleep 0.1
+echo -e "INTEGRITY CHECK: [ ${GREEN}PASSED${NC} ]"
+sleep 0.4
+
+type_text "${DARK_GREEN}SYSTEM READY${NC}" 0.05
+echo ""
+/etc/update-motd.d/10-hydra-status

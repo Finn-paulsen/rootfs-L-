@@ -1,0 +1,4 @@
+# Füge dies ans Ende deiner ~/.bashrc ein:
+# if [ -n "$PS1" ]; then
+#     /usr/local/bin/bootseq
+# fi
