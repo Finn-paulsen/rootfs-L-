@@ -1,62 +1,100 @@
 #!/bin/bash
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-NC='\033[0m'
+# ── Farben ──────────────────────────────────────────────────────────────────
+G='\033[0;32m'   # grün
+Y='\033[1;33m'   # gelb
+R='\033[0;31m'   # rot
+B='\033[1m'      # fett
+D='\033[2m'      # gedimmt
+NC='\033[0m'     # reset
 
-UPTIME=$(uptime -p | cut -d " " -f 2-)
+# ── Systemwerte ──────────────────────────────────────────────────────────────
+HOSTNAME=$(hostname)
 KERNEL=$(uname -r)
-IP_ADDR=$(hostname -I | awk '{print $1}')
-LOAD=$(cut -d ' ' -f1 /proc/loadavg)
-MEM_TOTAL=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
-MEM_FREE=$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)
-MEM_USED=$((MEM_TOTAL - MEM_FREE))
+ARCH=$(uname -m)
+IP=$(hostname -I | awk '{print $1}')
+UPTIME=$(uptime -p | sed 's/up //')
+LOAD=$(cut -d' ' -f1-3 /proc/loadavg)
+MEM_TOTAL=$(awk '/MemTotal/  {printf "%d", $2/1024}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+MEM_USED=$(( MEM_TOTAL - MEM_AVAIL ))
+DISK_USED=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
 
-echo ""
-echo -e "${BOLD}Project Hydra  —  NRF24-Gateway-01${NC}"
-echo -e "RF-Hub / Data Relay Node"
-echo ""
-echo -e "${YELLOW}System${NC}"
-echo -e "  Uptime:    ${UPTIME}"
-echo -e "  Kernel:    ${KERNEL}"
-echo -e "  IP:        ${IP_ADDR}"
-echo -e "  Load:      ${LOAD}"
-echo -e "  Memory:    ${MEM_USED} MB used / ${MEM_TOTAL} MB total"
-echo ""
-echo -e "${YELLOW}Hardware${NC}"
-echo -e "  CPU ............ [ ${GREEN}OK${NC} ]"
-echo -e "  RAM ............ [ ${GREEN}OK${NC} ]"
-echo -e "  Storage ........ [ ${GREEN}OK${NC} ]"
-echo -e "  Network ........ [ ${GREEN}OK${NC} ]"
-echo -e "  RF-Module (NRF24L01+) ... [ ${GREEN}SYNC ACTIVE${NC} ]"
-echo ""
-echo -e "${YELLOW}Services${NC}"
+# ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+check_ok()   { printf "  %-32s ${G}[ OK ]${NC}\n"       "$1"; }
+check_warn() { printf "  %-32s ${Y}[ %-8s ]${NC}\n"    "$1" "$2"; }
+check_fail() { printf "  %-32s ${R}[ FAILED ]${NC}\n"   "$1"; }
+check_val()  { printf "  %-32s ${G}%s${NC}\n"           "$1" "$2"; }
+section()    { echo -e "\n${Y}── $1${NC}"; }
 
-# Python3 vorhanden?
+# ── Ausgabe ──────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${B}Project Hydra  ·  ${HOSTNAME}${NC}"
+echo -e "${D}RF-Hub / Data Relay Node  ·  Raspberry Pi 2${NC}"
+echo -e "${D}─────────────────────────────────────────────${NC}"
+
+section "System"
+check_val "Kernel"           "${KERNEL}  (${ARCH})"
+check_val "Uptime"           "${UPTIME}"
+check_val "Load (1/5/15 min)" "${LOAD}"
+check_val "Memory"           "${MEM_USED} MB used / ${MEM_TOTAL} MB total"
+check_val "Disk (/)"         "${DISK_USED}"
+check_val "IP"               "${IP}"
+
+section "Hardware"
+check_ok  "CPU (BCM2836, 4× Cortex-A7)"
+check_ok  "RAM (1 GB)"
+check_ok  "Storage"
+check_ok  "Network interface"
+
+# SPI – nötig für NRF24L01+
+if ls /dev/spidev* >/dev/null 2>&1; then
+    check_ok  "SPI interface"
+else
+    check_warn "SPI interface" "DISABLED"
+fi
+
+# NRF24 Kernel-Modul geladen?
+if lsmod 2>/dev/null | grep -qi "nrf24\|rf69\|spi"; then
+    check_ok  "RF-Module (NRF24L01+)"
+else
+    check_warn "RF-Module (NRF24L01+)" "NOT LOADED"
+fi
+
+section "Dependencies"
+
+# Python3
 if command -v python3 >/dev/null 2>&1; then
     PY_VER=$(python3 --version 2>&1 | awk '{print $2}')
-    echo -e "  python3 ........ [ ${GREEN}${PY_VER}${NC} ]"
+    check_val "python3" "${PY_VER}"
 else
-    echo -e "  python3 ........ [ ${RED}NOT FOUND${NC} ]"
+    check_fail "python3"
 fi
 
-# RF-Skript vorhanden?
+# requests
+if python3 -c "import requests" 2>/dev/null; then
+    check_ok "python3  ·  requests"
+else
+    check_fail "python3  ·  requests"
+fi
+
+# RPi.GPIO oder gpiozero
+if python3 -c "import RPi.GPIO" 2>/dev/null || python3 -c "import gpiozero" 2>/dev/null; then
+    check_ok "python3  ·  GPIO library"
+else
+    check_warn "python3  ·  GPIO library" "MISSING"
+fi
+
+# hub/send_test.py
 if [ -f /home/finn/hydra/hub/send_test.py ]; then
-    echo -e "  hub/send_test .. [ ${GREEN}PRESENT${NC} ]"
+    check_ok "hydra/hub/send_test.py"
 else
-    echo -e "  hub/send_test .. [ ${RED}MISSING${NC} ]"
+    check_fail "hydra/hub/send_test.py"
 fi
 
-# SPI-Interface aktiv?
-if ls /dev/spidev* >/dev/null 2>&1; then
-    echo -e "  SPI interface .. [ ${GREEN}ACTIVE${NC} ]"
-else
-    echo -e "  SPI interface .. [ ${YELLOW}DISABLED${NC} ]"
-fi
+section "Network"
+/usr/local/bin/check_backend.sh
 
 echo ""
-echo -e "${YELLOW}Network${NC}"
-/usr/local/bin/check_backend.sh
+echo -e "${D}─────────────────────────────────────────────${NC}"
 echo ""
