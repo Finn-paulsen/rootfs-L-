@@ -1,0 +1,10 @@
+#!/bin/bash
+
+echo "###############################################"
+echo "#   NRF24-Gateway-01 – Funk-Hub Initialisiert  #"
+echo "#   Systemstatus: LINK ESTABLISHED             #"
+echo "#   RF-Modul:   Synchronisation aktiv …        #"
+/usr/local/bin/check_backend.sh
+echo "###############################################"
+
+
